@@ -136,8 +136,7 @@ class EarlyStoppingCallback(TrainerCallback):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--c
-onfig", type=str, default="config.yaml", help="Path to config file"
+        "--config", type=str, default="config.yaml", help="Path to config file"
     )
     parser.add_argument(
         "--train_data", type=str, help="Override train data path from config"
@@ -156,7 +155,7 @@ def load_environment(args):
     load_dotenv(args.env)
 
     # Check for required environment variables
-    required_vars = ["HF_TOKEN"]
+    required_vars = ["HUGGINGFACE_API_KEY"]
     missing_vars = [var for var in required_vars if not os.getenv(var)]
     if missing_vars:
         raise ValueError(
@@ -164,13 +163,14 @@ def load_environment(args):
         )
 
     return {
-        "hf_token": os.getenv("HF_TOKEN"),
+        "hf_token": os.getenv("HUGGINGFACE_API_KEY"),
         "wandb_api_key": os.getenv("WANDB_API_KEY"),
     }
 
 
 def get_peft_regex(
     model,
+    layers: list[int]=None,
     finetune_vision_layers: bool = True,
     finetune_language_layers: bool = True,
     finetune_attention_modules: bool = True,
@@ -221,6 +221,7 @@ def get_peft_regex(
 
     # Isolate lm_head / projection matrices if count == 1
     if target_modules is None:
+        
         only_linear_modules = []
         projection_modules = {}
         for j, (proj, count) in enumerate(all_linear_modules.items()):
@@ -231,7 +232,7 @@ def get_peft_regex(
     else:
         assert type(target_modules) is list
         only_linear_modules = list(target_modules)
-
+    
     # Create regex matcher
     regex_model_parts = []
     if finetune_vision_layers:
@@ -261,7 +262,17 @@ def get_peft_regex(
     )
 
     # Also account for model.layers.0.self_attn/mlp type modules like Qwen
-    if finetune_language_layers:
+    if finetune_language_layers and layers is not None:
+        regex_matcher = (
+            r"(?:"
+            + regex_matcher
+            + rf")|(?:\bmodel\.layers\.{layers}\.(?:"
+            + regex_components
+            + r")\.(?:"
+            + match_linear_modules
+            + r"))"
+        )
+    else:
         regex_matcher = (
             r"(?:"
             + regex_matcher
@@ -271,7 +282,6 @@ def get_peft_regex(
             + match_linear_modules
             + r"))"
         )
-
     # Check if regex is wrong since model does not have vision parts
     check = any(
         re.search(regex_matcher, name, flags=re.DOTALL) for name in linear_modules
@@ -365,14 +375,16 @@ def main():
 
     # Prepare model for training
     model = prepare_model_for_kbit_training(model)
-
+    print(cfg.lora.target_modules)
     # Get regex pattern for LoRA
     regex_pattern = get_peft_regex(
         model,
+        layers=cfg.lora.layers, #set to None if you want to consider all layers
         finetune_vision_layers=cfg.lora.finetune_vision_layers,
         finetune_language_layers=cfg.lora.finetune_language_layers,
         finetune_attention_modules=cfg.lora.finetune_attention_modules,
         finetune_mlp_modules=cfg.lora.finetune_mlp_modules,
+        target_modules=list(cfg.lora.target_modules),
     )
     print(f"{regex_pattern=}")
 

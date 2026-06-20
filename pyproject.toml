@@ -5,7 +5,18 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "accelerate>=1.14.0",
+    "bitsandbytes>=0.49.2",
+    "datasets>=5.0.0",
+    "dotenv>=0.9.9",
     "huggingface>=0.0.1",
+    "matplotlib>=3.11.0",
+    "omegaconf>=2.3.1",
+    "peft>=0.19.1",
+    "tf-keras>=2.21.0",
     "tinker>=0.22.3",
     "tinker-cookbook>=0.4.2",
+    "transformers>=5.5.3",
+    "trl==0.17.0",
+    "wandb>=0.27.2",
 ]
