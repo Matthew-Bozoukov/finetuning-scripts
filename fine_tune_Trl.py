@@ -51,6 +51,68 @@ def tokenize_with_chat_template(dataset, tokenizer):
     return dataset
 
 
+EMPTY_THINKING_BLOCK = "<think>\n\n</think>\n\n"
+
+
+def add_empty_thinking_block(example):
+    """Prepend an empty `<think>...</think>` block to every assistant turn so the
+    reasoning structure is present (and gets masked out of the loss) while no
+    reasoning content is trained."""
+    for message in example["messages"]:
+        if message["role"] == "assistant" and not message["content"].lstrip().startswith(
+            "<think>"
+        ):
+            message["content"] = EMPTY_THINKING_BLOCK + message["content"]
+    return example
+
+
+def find_subsequence_indices(sequence, subseq):
+    """Return the start indices where the token subsequence `subseq` occurs in `sequence`."""
+    if not subseq:
+        return []
+    n, m = len(sequence), len(subseq)
+    return [i for i in range(n - m + 1) if sequence[i : i + m] == subseq]
+
+
+def get_thinking_token_ids(tokenizer):
+    """Token ids for the `<think>` / `</think>` markers (may be multi-token)."""
+    start = tokenizer.encode("<think>", add_special_tokens=False)
+    end = tokenizer.encode("</think>", add_special_tokens=False)
+    return start, end
+
+
+class DataCollatorForCompletionOnlyLMWithThinkingMask(DataCollatorForCompletionOnlyLM):
+    """Completion-only collator that additionally masks every `<think>...</think>`
+    span in the labels, so no loss is computed on reasoning tokens. This keeps the
+    model's thinking channel intact (untrained) while it still learns the final answer.
+    """
+
+    def __init__(self, *args, think_start_ids=None, think_end_ids=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.think_start_ids = list(think_start_ids) if think_start_ids else None
+        self.think_end_ids = list(think_end_ids) if think_end_ids else None
+
+    def torch_call(self, examples):
+        batch = super().torch_call(examples)
+        if not self.think_start_ids or not self.think_end_ids:
+            return batch
+
+        input_ids = batch["input_ids"]
+        labels = batch["labels"]
+        seq_len = input_ids.size(1)
+        for i in range(input_ids.size(0)):
+            ids = input_ids[i].tolist()
+            starts = find_subsequence_indices(ids, self.think_start_ids)
+            ends = find_subsequence_indices(ids, self.think_end_ids)
+            for s in starts:
+                # first </think> that begins at or after this <think>
+                close = next((e for e in ends if e >= s), None)
+                end = close + len(self.think_end_ids) if close is not None else seq_len
+                labels[i, s:end] = -100
+        batch["labels"] = labels
+        return batch
+
+
 def upload_to_hub(model_path, repo_id, subfolder_name, hf_token):
     """Upload the fine-tuned model to a specific subfolder in the Hugging Face Hub."""
     target_repo = f"{repo_id}/{subfolder_name}"
@@ -145,6 +207,8 @@ def parse_args():
         "--test_data", type=str, help="Override test data path from config"
     )
     parser.add_argument("--env", type=str, default=".env", help="Path to .env file")
+    parser.add_argument("--model_type", type=str, choices=["gemma2", "qwen"], help="Type of model to fine-tune")
+
     return parser.parse_args()
 
 def load_environment(args):
@@ -342,6 +406,12 @@ def main():
         print(f"Number of training examples: {len(train_dataset)}")
         print("No validation set (validation_split = 0)")
 
+    # For Qwen, inject an empty thinking block into every assistant turn.
+    if args.model_type == "qwen":
+        train_dataset = train_dataset.map(add_empty_thinking_block)
+        if test_dataset is not None:
+            test_dataset = test_dataset.map(add_empty_thinking_block)
+
     # Model and tokenizer setup
     tokenizer = AutoTokenizer.from_pretrained(
         cfg.model.model_id, token=env_vars["hf_token"], trust_remote_code=True
@@ -448,15 +518,32 @@ def main():
                 start_method="thread"
             ),  # Use thread-based initialization
         )
+    if args.model_type == "gemma2":
+        instruction_template = "user\n"
+        response_template = "model\n"
+        collator = DataCollatorForCompletionOnlyLM(
+            instruction_template=instruction_template,
+            response_template=response_template,
+            tokenizer=tokenizer,
+            mlm=False,
+        )
+    elif args.model_type == "qwen":
+        instruction_template = "<|im_start|>user\n"
+        response_template = "<|im_start|>assistant\n"
+        # Mask <think>...</think> spans so no loss is computed on reasoning tokens.
+        think_start_ids, think_end_ids = get_thinking_token_ids(tokenizer)
+        print(f"{think_start_ids=} {think_end_ids=}")
+        collator = DataCollatorForCompletionOnlyLMWithThinkingMask(
+            instruction_template=instruction_template,
+            response_template=response_template,
+            tokenizer=tokenizer,
+            mlm=False,
+            think_start_ids=think_start_ids,
+            think_end_ids=think_end_ids,
+        )
+    else:
+        raise ValueError(f"Unknown --model_type: {args.model_type!r} (expected 'gemma2' or 'qwen')")
 
-    instruction_template = "user\n"
-    response_template = "model\n"
-    collator = DataCollatorForCompletionOnlyLM(
-        instruction_template=instruction_template,
-        response_template=response_template,
-        tokenizer=tokenizer,
-        mlm=False,
-    )
 
     # Initialize trainer
     trainer = SFTTrainer(
